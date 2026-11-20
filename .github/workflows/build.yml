@@ -1,0 +1,43 @@
+name: Build
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ "v*" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      # maven-assembly-plugin 已绑定到 package 阶段，构建时自动生成 jar-with-dependencies
+      - name: Build
+        run: mvn -B -DskipTests package
+
+      - name: Upload jar-with-dependencies
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apple9317-ServerLauncher-jar-with-dependencies
+          path: target/*-jar-with-dependencies.jar
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 \
+            || gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --notes "自动构建 ${GITHUB_REF_NAME}"
+          gh release upload "${GITHUB_REF_NAME}" target/*-jar-with-dependencies.jar --clobber
