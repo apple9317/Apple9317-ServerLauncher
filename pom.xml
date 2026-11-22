@@ -6,7 +6,7 @@
 
     <groupId>com.apple9317</groupId>
     <artifactId>Apple9317-ServerLauncher</artifactId>
-    <version>1.2.1</version>
+    <version>1.2.2</version>
     <name>Apple9317-ServerLauncher</name>
     <description>基于 BHMultiServerLauncher 修改的多服务器启动与管理工具</description>
 

@@ -51,6 +51,12 @@ public class ServerLauncher {
     /** quit/exit 已经打印过"正在关闭所有服务器..."，避免关闭钩子重复打印 */
     private volatile boolean shutdownMessagePrinted = false;
     private volatile ForceStopRequest pendingForceStop;
+    /** 正在执行 update（重启）的服务器，用于状态展示 */
+    private final Set<String> restartingServers = ConcurrentHashMap.newKeySet();
+    /** 是否有 update 任务正在执行 */
+    private volatile boolean updateInProgress = false;
+    /** 每个服务器一把启动锁，保证“是否已运行”的检查与进程登记是原子的 */
+    private final Map<String, Object> startLocks = new ConcurrentHashMap<>();
 
     public static void main(String[] args) {
         if (args.length < 1) {
@@ -123,24 +129,48 @@ public class ServerLauncher {
     }
 
     private void startServer(ServerConfig serverConfig) throws IOException {
+        Object startLock = startLocks.computeIfAbsent(serverConfig.name, key -> new Object());
+
+        Process process;
+        PrintWriter processWriter;
+        PrintWriter logWriter;
+
         String logFileName = String.format("%s/%s-%s.log",
                 config.logDirectory, serverConfig.name, DATE_FORMAT.format(new Date()));
 
-        try (PrintWriter logWriter = new PrintWriter(new FileWriter(logFileName, true))) {
-            ProcessBuilder builder = new ProcessBuilder(parseCommand(serverConfig.startCommand));
-            builder.directory(new File(serverConfig.workingDirectory));
-            builder.redirectErrorStream(true); // 合并标准错误和标准输出
+        // 检查与登记必须在同一把锁内完成，否则 update 与手动 start 可能同时通过“是否已在运行”的检查，
+        // 拉起两个进程，其中一个会成为不受管理的孤儿进程
+        synchronized (startLock) {
+            Process runningProcess = serverProcesses.get(serverConfig.name);
+            if (runningProcess != null && runningProcess.isAlive()) {
+                System.out.println("[" + serverConfig.name + "] 已经在运行中，忽略重复启动");
+                return;
+            }
 
-            Process process = builder.start();
+            logWriter = new PrintWriter(new FileWriter(logFileName, true));
+
+            try {
+                ProcessBuilder builder = new ProcessBuilder(parseCommand(serverConfig.startCommand));
+                builder.directory(new File(serverConfig.workingDirectory));
+                builder.redirectErrorStream(true); // 合并标准错误和标准输出
+
+                process = builder.start();
+            } catch (IOException | RuntimeException e) {
+                logWriter.close();
+                throw e;
+            }
+
             stoppingServers.remove(serverConfig.name);
             serverProcesses.put(serverConfig.name, process);
 
             // 获取进程的输出流用于发送命令
-            PrintWriter processWriter = new PrintWriter(process.getOutputStream());
+            processWriter = new PrintWriter(process.getOutputStream());
             serverWriters.put(serverConfig.name, processWriter);
 
             System.out.println("[" + serverConfig.name + "] 服务器已启动");
+        }
 
+        try (PrintWriter log = logWriter) {
             // 读取进程输出
             BufferedReader reader = new BufferedReader(
                     new InputStreamReader(process.getInputStream()));
@@ -154,18 +184,18 @@ public class ServerLauncher {
                 System.out.println(formattedLine);
 
                 // 写入日志文件
-                logWriter.println(formattedLine);
-                logWriter.flush();
+                log.println(formattedLine);
+                log.flush();
             }
 
             int exitCode = process.waitFor();
             String exitMessage = String.format("[%s] 服务器进程已退出，代码: %d", serverConfig.name, exitCode);
             System.out.println(exitMessage);
-            logWriter.println(exitMessage);
+            log.println(exitMessage);
 
-            // 从映射中移除
-            serverProcesses.remove(serverConfig.name);
-            serverWriters.remove(serverConfig.name);
+            // 从映射中移除（仅移除本次启动的进程，避免误删 update 重新拉起的新进程）
+            serverProcesses.remove(serverConfig.name, process);
+            serverWriters.remove(serverConfig.name, processWriter);
 
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -209,6 +239,7 @@ public class ServerLauncher {
                         "start <服务器> - 启动指定服务器\n" +
                         "stop <服务器> - 发送 stop/end/exit 正常关闭服务器\n" +
                         "stop <服务器> force - 强制结束服务器进程（需要再次输入确认）\n" +
+                        "update [服务器|all] - 关闭并重新启动服务器以应用更新（不填则更新全部）\n" +
                         "send <服务器> <命令> - 向指定服务器发送命令\n" +
                         "broadcast <命令> - 向所有服务器发送命令\n" +
                         "status <服务器> - 查看服务器状态\n" +
@@ -221,7 +252,15 @@ public class ServerLauncher {
                     Process serverProcess = serverProcesses.get(server.name);
                     String state;
                     if (serverProcess != null && serverProcess.isAlive()) {
-                        state = stoppingServers.contains(server.name) ? "正在停止" : "运行中";
+                        if (stoppingServers.contains(server.name)) {
+                            state = "正在停止";
+                        } else if (restartingServers.contains(server.name)) {
+                            state = "更新中";
+                        } else {
+                            state = "运行中";
+                        }
+                    } else if (restartingServers.contains(server.name)) {
+                        state = "更新中";
                     } else {
                         state = "已停止";
                     }
@@ -241,6 +280,10 @@ public class ServerLauncher {
 
                 if (targetServerConfig == null) {
                     return "错误: 服务器 '" + arg + "' 不存在";
+                }
+
+                if (restartingServers.contains(arg)) {
+                    return "错误: 服务器 '" + arg + "' 正在更新中，请等待其重新启动";
                 }
 
                 Process existingProcess = serverProcesses.get(arg);
@@ -268,6 +311,9 @@ public class ServerLauncher {
 
             case "stop":
                 return handleStopCommand(arg);
+
+            case "update":
+                return handleUpdateCommand(arg);
 
             case "send":
                 if (arg.isEmpty()) {
@@ -324,7 +370,14 @@ public class ServerLauncher {
                     return "服务器 '" + arg + "' 状态: 已停止";
                 }
 
-                String status = stoppingServers.contains(arg) ? "正在停止" : "运行中";
+                String status;
+                if (stoppingServers.contains(arg)) {
+                    status = "正在停止";
+                } else if (restartingServers.contains(arg)) {
+                    status = "更新中";
+                } else {
+                    status = "运行中";
+                }
                 return "服务器 '" + arg + "' 状态: " + status +
                         (process.isAlive() ? " (PID: " + process.pid() + ")" : "");
 
@@ -380,6 +433,208 @@ public class ServerLauncher {
         }
 
         return handleGracefulStop(serverName, process);
+    }
+
+    /**
+     * 处理 update 命令：关闭并重新启动服务器，用于应用文件更新（插件/jar/配置等）。
+     * <p>update：等同于 update all；update &lt;服务器&gt;：更新指定服务器；update all：依次更新全部服务器。</p>
+     */
+    private String handleUpdateCommand(String arg) {
+        if (updateInProgress) {
+            return "错误: 已有 update 任务正在进行中，请等待其完成";
+        }
+
+        List<ServerConfig> targets = new ArrayList<>();
+        String targetLabel;
+
+        if (arg.isEmpty() || arg.equalsIgnoreCase("all")) {
+            if (config == null || config.servers == null || config.servers.length == 0) {
+                return "配置中没有服务器";
+            }
+            for (ServerConfig server : config.servers) {
+                targets.add(server);
+            }
+            targetLabel = "全部服务器";
+        } else {
+            ServerConfig serverConfig = findServerConfig(arg);
+            if (serverConfig == null) {
+                return "错误: 服务器 '" + arg + "' 不存在";
+            }
+            targets.add(serverConfig);
+            targetLabel = "服务器 '" + arg + "'";
+        }
+
+        List<String> names = new ArrayList<>();
+        for (ServerConfig server : targets) {
+            names.add(server.name);
+        }
+
+        updateInProgress = true;
+        executorService.submit(() -> restartServers(targets));
+
+        return "开始更新 " + targetLabel + "（共 " + targets.size() + " 个）: " + String.join(", ", names)
+                + "\n将依次正常关闭并重新启动，进度见下方输出";
+    }
+
+    /**
+     * 依次重启 update 的目标服务器：先正常关闭（必要时强制结束），确认旧进程退出后再重新启动。
+     */
+    private void restartServers(List<ServerConfig> targets) {
+        int succeeded = 0;
+        int failed = 0;
+        try {
+            for (int i = 0; i < targets.size(); i++) {
+                ServerConfig serverConfig = targets.get(i);
+                String serverName = serverConfig.name;
+                System.out.println("[" + serverName + "] 开始更新 (" + (i + 1) + "/" + targets.size() + ")");
+                restartingServers.add(serverName);
+
+                try {
+                    Process process = serverProcesses.get(serverName);
+                    if (process != null && process.isAlive()) {
+                        if (!stopForRestart(serverName, process)) {
+                            failed++;
+                            System.out.println("[" + serverName + "] 更新失败: 旧进程无法停止，已跳过启动");
+                            continue;
+                        }
+                    }
+
+                    Process leftover = serverProcesses.get(serverName);
+                    if (leftover != null && !leftover.isAlive()) {
+                        cleanupServer(serverName);
+                    }
+                    if (!awaitProcessRecordRemoved(serverName, 10000L)) {
+                        System.out.println("[" + serverName + "] 旧进程记录未能及时清理，强制清理后继续");
+                        cleanupServer(serverName);
+                    }
+
+                    final ServerConfig finalServerConfig = serverConfig;
+                    executorService.submit(() -> {
+                        try {
+                            startServer(finalServerConfig);
+                        } catch (IOException e) {
+                            System.err.println("启动服务器 " + finalServerConfig.name + " 失败: " + e.getMessage());
+                        }
+                    });
+
+                    if (!awaitServerRegistered(serverName, 60000L)) {
+                        failed++;
+                        System.out.println("[" + serverName + "] 更新失败: 服务器未能在 60 秒内完成启动");
+                        continue;
+                    }
+
+                    succeeded++;
+                    System.out.println("[" + serverName + "] 更新完成");
+                } finally {
+                    restartingServers.remove(serverName);
+                }
+            }
+        } finally {
+            updateInProgress = false;
+            System.out.println("update 结束: 成功 " + succeeded + " 个，失败 " + failed + " 个");
+        }
+    }
+
+    /**
+     * 更新流程中的关闭：依次发送 stop/end/exit，仍不退出时强制结束进程树。
+     *
+     * @return 进程是否已退出
+     */
+    private boolean stopForRestart(String serverName, Process process) {
+        stoppingServers.add(serverName);
+        try {
+            System.out.println("[" + serverName + "] 正在关闭服务器...");
+            for (int i = 0; i < GRACEFUL_STOP_COMMANDS.length; i++) {
+                if (!process.isAlive()) {
+                    System.out.println("[" + serverName + "] 服务器已退出，代码: " + process.exitValue());
+                    return true;
+                }
+
+                PrintWriter writer = serverWriters.get(serverName);
+                if (writer == null) {
+                    System.out.println("[" + serverName + "] 无法写入服务器标准输入，改为强制结束");
+                    break;
+                }
+
+                String stopCommand = GRACEFUL_STOP_COMMANDS[i];
+                writer.println(stopCommand);
+                writer.flush();
+                System.out.println("[" + serverName + "] 已发送命令 '" + stopCommand + "'，等待 "
+                        + (GRACEFUL_STOP_WAITS_MS[i] / 1000) + " 秒");
+
+                if (process.waitFor(GRACEFUL_STOP_WAITS_MS[i], TimeUnit.MILLISECONDS)) {
+                    System.out.println("[" + serverName + "] 服务器已退出，代码: " + process.exitValue());
+                    return true;
+                }
+            }
+
+            if (!process.isAlive()) {
+                return true;
+            }
+
+            System.out.println("[" + serverName + "] 服务器未能正常关闭，强制结束进程（PID: " + process.pid() + "）");
+            if (killProcessTree(process)) {
+                System.out.println("[" + serverName + "] 服务器已强制结束，代码: " + process.exitValue());
+                return true;
+            }
+
+            System.out.println("[" + serverName + "] 强制结束失败，进程仍在运行（PID: " + process.pid() + "）");
+            return false;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            System.out.println("[" + serverName + "] 关闭等待被中断");
+            return false;
+        } finally {
+            stoppingServers.remove(serverName);
+        }
+    }
+
+    /** 强制结束进程及其派生子进程，返回进程是否已退出 */
+    private boolean killProcessTree(Process process) {
+        try {
+            // 先结束派生的子进程（如通过 .sh/.bat 启动脚本拉起的真正服务端进程），再结束父进程
+            process.descendants().forEach(ProcessHandle::destroyForcibly);
+            process.destroyForcibly();
+            return process.waitFor(FORCE_STOP_WAIT_MS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    /** 等待已退出的进程从 serverProcesses 中清理掉 */
+    private boolean awaitProcessRecordRemoved(String serverName, long timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            if (serverProcesses.get(serverName) == null) {
+                return true;
+            }
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return false;
+    }
+
+    /** 等待 update 重新拉起的服务器进程登记到 serverProcesses */
+    private boolean awaitServerRegistered(String serverName, long timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            Process process = serverProcesses.get(serverName);
+            if (process != null && process.isAlive()) {
+                return true;
+            }
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return false;
     }
 
     private String handleGracefulStop(String serverName, Process process) {
@@ -456,11 +711,7 @@ public class ServerLauncher {
     private String forceStop(String serverName, Process process) {
         stoppingServers.add(serverName);
         try {
-            // 先结束派生的子进程（如通过 .bat/启动脚本拉起的真正服务端进程），再结束父进程
-            process.descendants().forEach(ProcessHandle::destroyForcibly);
-            process.destroyForcibly();
-
-            if (process.waitFor(FORCE_STOP_WAIT_MS, TimeUnit.MILLISECONDS)) {
+            if (killProcessTree(process)) {
                 int exitCode = process.exitValue();
                 cleanupServer(serverName);
                 return "服务器 '" + serverName + "' 已被强制关闭，代码: " + exitCode;
@@ -468,9 +719,6 @@ public class ServerLauncher {
 
             return "已发送强制结束信号，但服务器 '" + serverName
                     + "' 的进程仍在运行，请手动检查（PID: " + process.pid() + "）";
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return "强制关闭服务器 '" + serverName + "' 时被中断";
         } finally {
             stoppingServers.remove(serverName);
         }
